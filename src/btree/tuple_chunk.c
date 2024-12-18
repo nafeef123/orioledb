@@ -58,8 +58,8 @@ tuple_chunk_estimate_change(BTreeChunkDesc *desc, OffsetNumber itemOffset,
 	else if (operation == BTreeChunkOperationUpdate)
 	{
 		sizeNeeded = (get_tuple_chunk_header_size(desc->chunkType) +
-			MAXALIGN(get_tuple_chunk_tuple_size(desc->treeDesc,
-												desc->chunkType, tuple))) -
+					  MAXALIGN(get_tuple_chunk_tuple_size(desc->treeDesc,
+														  desc->chunkType, tuple))) -
 			get_tuple_chunk_item_size(desc, itemOffset);
 
 		/* We don't move items to fill the gap if the new tuple is smaller */
