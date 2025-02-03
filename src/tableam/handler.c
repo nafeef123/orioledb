@@ -980,7 +980,9 @@ orioledb_estimate_rel_size(Relation rel, int32 *attr_widths,
 	/* coerce values in pg_class to more desirable types */
 	relpages = (BlockNumber) rel->rd_rel->relpages;
 	reltuples = (double) rel->rd_rel->reltuples;
-	relallvisible = (BlockNumber) rel->rd_rel->relallvisible;
+
+	/* HACK: For orioledb assuming all pages are visible */
+	relallvisible = (BlockNumber) rel->rd_rel->relpages;
 
 	/*
 	 * HACK: if the relation has never yet been vacuumed, use a minimum size
