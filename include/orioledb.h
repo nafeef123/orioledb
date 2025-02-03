@@ -112,17 +112,25 @@ typedef enum
 	UndoLogNone = -1,
 
 	/*
-	 * Undo log for modification of user data.
+	 * Undo log for row-level record of modifications of user data.
 	 */
 	UndoLogRegular = 0,
 
 	/*
+	 * Undo log for page-level record of modifications of user data.
+	 */
+	UndoLogRegularPageLevel = 1,
+
+	/*
 	 * Undo log for modification of system trees.
 	 */
-	UndoLogSystem = 1,
+	UndoLogSystem = 2,
 
-	UndoLogsCount = 2
+	UndoLogsCount = 3
 } UndoLogType;
+
+#define GET_PAGE_LEVEL_UNDO_TYPE(undoType) \
+	(((undoType) == UndoLogRegular) ? UndoLogRegularPageLevel : (undoType))
 
 typedef struct
 {

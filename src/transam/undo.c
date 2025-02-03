@@ -27,6 +27,7 @@
 #include "transam/undo.h"
 #include "utils/o_buffers.h"
 #include "utils/page_pool.h"
+#include "utils/snapshot.h"
 #include "utils/stopevent.h"
 
 #include "access/transam.h"
@@ -41,7 +42,8 @@
 
 static int	undoLocCmp(const pairingheap_node *a, const pairingheap_node *b, void *arg);
 
-static pairingheap retainUndoLocRegularHeap = {&undoLocCmp, NULL, NULL};
+static pairingheap retainUndoLocRegularRowHeap = {&undoLocCmp, NULL, NULL};
+static pairingheap retainUndoLocRegularPageHeap = {&undoLocCmp, NULL, NULL};
 static pairingheap retainUndoLocSystemHeap = {&undoLocCmp, NULL, NULL};
 
 typedef void (*UndoCallback) (UndoLogType undoType, UndoLocation location,
@@ -122,15 +124,24 @@ UndoLocation curRetainUndoLocations[(int) UndoLogsCount] =
 };
 bool		oxid_needs_wal_flush = false;
 
-static Size reserved_undo_size = 0;
+static Size reserved_undo_sizes[(int) UndoLogsCount] =
+{
+	0
+};
 
 static OBuffersDesc undoBuffersDescs[(int) UndoLogsCount] =
 {
 	{
 		.singleFileSize = UNDO_FILE_SIZE,
-			.filenameTemplate = ORIOLEDB_UNDO_DATA_FILENAME_TEMPLATE,
-			.groupCtlTrancheName = "undoRegularBuffersGroupCtlTranche",
-			.bufferCtlTrancheName = "undoRegularBuffersCtlTranche"
+			.filenameTemplate = ORIOLEDB_UNDO_DATA_ROW_FILENAME_TEMPLATE,
+			.groupCtlTrancheName = "undoRegularRowBuffersGroupCtlTranche",
+			.bufferCtlTrancheName = "undoRegularRowBuffersCtlTranche"
+	},
+	{
+		.singleFileSize = UNDO_FILE_SIZE,
+			.filenameTemplate = ORIOLEDB_UNDO_DATA_PAGE_FILENAME_TEMPLATE,
+			.groupCtlTrancheName = "undoRegularPageBuffersGroupCtlTranche",
+			.bufferCtlTrancheName = "undoRegularPageBuffersCtlTranche"
 	},
 	{
 		.singleFileSize = UNDO_FILE_SIZE,
@@ -152,7 +163,8 @@ undo_shmem_needs(void)
 	size = CACHELINEALIGN(sizeof(UndoMeta) * (int) UndoLogsCount);
 	size = add_size(size, undo_circular_buffer_size);
 	size = add_size(size, undo_system_circular_buffer_size);
-	undoBuffersDescs[UndoLogRegular].buffersCount = undo_buffers_count;
+	undoBuffersDescs[UndoLogRegular].buffersCount = undo_buffers_count / 2;
+	undoBuffersDescs[UndoLogRegularPageLevel].buffersCount = undo_buffers_count / 2;
 	undoBuffersDescs[UndoLogSystem].buffersCount = undo_system_buffers_count;
 	for (i = 0; i < (int) UndoLogsCount; i++)
 		size = add_size(size, o_buffers_shmem_needs(&undoBuffersDescs[i]));
@@ -173,8 +185,11 @@ undo_shmem_init(Pointer buf, bool found)
 	ptr += CACHELINEALIGN(sizeof(PendingTruncatesMeta));
 
 	o_undo_buffers[UndoLogRegular] = ptr;
-	o_undo_circular_sizes[UndoLogRegular] = undo_circular_buffer_size;
-	ptr += undo_circular_buffer_size;
+	o_undo_circular_sizes[UndoLogRegular] = undo_circular_buffer_size / 2;
+	ptr += undo_circular_buffer_size / 2;
+	o_undo_buffers[UndoLogRegularPageLevel] = ptr;
+	o_undo_circular_sizes[UndoLogRegularPageLevel] = undo_circular_buffer_size / 2;
+	ptr += undo_circular_buffer_size / 2;
 	o_undo_buffers[UndoLogSystem] = ptr;
 	o_undo_circular_sizes[UndoLogSystem] = undo_system_circular_buffer_size;
 	ptr += undo_system_circular_buffer_size;
@@ -776,7 +791,7 @@ on_commit_undo_stack(UndoLogType undoType, OXid oxid, bool changeCountsValid)
 	walk_undo_stack(undoType, oxid, NULL, false, changeCountsValid);
 }
 
-static bool
+bool
 undo_type_has_retained_location(UndoLogType undoType)
 {
 	ODBProcData *curProcData = GET_CUR_PROCDATA();
@@ -813,7 +828,7 @@ free_retained_undo_location(UndoLogType undoType)
 {
 	ODBProcData *curProcData = GET_CUR_PROCDATA();
 
-	Assert(reserved_undo_size == 0);
+	Assert(reserved_undo_sizes[(int) undoType] == 0);
 	Assert(pg_atomic_read_u64(&curProcData->undoRetainLocations[(int) undoType].reservedUndoLocation) == InvalidUndoLocation);
 	pg_atomic_write_u64(&curProcData->undoRetainLocations[(int) undoType].transactionUndoRetainLocation, InvalidUndoLocation);
 	curRetainUndoLocations[undoType] = InvalidUndoLocation;
@@ -963,13 +978,13 @@ reserve_undo_size_extended(UndoLogType undoType, Size size,
 	Assert(undoType != UndoLogNone);
 	Assert(size > 0);
 
-	if (reserved_undo_size >= size)
+	if (reserved_undo_sizes[(int) undoType] >= size)
 		return true;
 
-	size -= reserved_undo_size;
+	size -= reserved_undo_sizes[(int) undoType];
 
 	location = pg_atomic_fetch_add_u64(&meta->advanceReservedLocation, size);
-	reserved_undo_size += size;
+	reserved_undo_sizes[(int) undoType] += size;
 
 	if (location + size <=
 		pg_atomic_read_u64(&meta->writtenLocation) + circularBufferSize)
@@ -986,7 +1001,7 @@ reserve_undo_size_extended(UndoLogType undoType, Size size,
 		 * and must revert this action
 		 */
 		pg_atomic_fetch_sub_u64(&meta->advanceReservedLocation, size);
-		reserved_undo_size -= size;
+		reserved_undo_sizes[(int) undoType] -= size;
 		if (reportError)
 			report_undo_overflow();
 		else
@@ -1004,7 +1019,7 @@ reserve_undo_size_extended(UndoLogType undoType, Size size,
 		 * No more chances to succeed without waiting.
 		 */
 		pg_atomic_fetch_sub_u64(&meta->advanceReservedLocation, size);
-		reserved_undo_size -= size;
+		reserved_undo_sizes[(int) undoType] -= size;
 		if (reportError)
 			report_undo_overflow();
 		else
@@ -1088,10 +1103,10 @@ get_undo_record(UndoLogType undoType, UndoLocation *undoLocation, Size size)
 	{
 		UndoLocation location;
 
-		Assert(reserved_undo_size >= size);
+		Assert(reserved_undo_sizes[(int) undoType] >= size);
 
 		location = pg_atomic_fetch_add_u64(&meta->lastUsedLocation, size);
-		reserved_undo_size -= size;
+		reserved_undo_sizes[(int) undoType] -= size;
 
 		/*
 		 * We might hit the boundary of circular buffer.  If so then just
@@ -1113,7 +1128,7 @@ Pointer
 get_undo_record_unreserved(UndoLogType type, UndoLocation *undoLocation, Size size)
 {
 	Assert(size == MAXALIGN(size));
-	Assert(reserved_undo_size == 0);
+	Assert(reserved_undo_sizes[(int) type] == 0);
 
 	reserve_undo_size(type, 2 * size);
 	return get_undo_record(type, undoLocation, size);
@@ -1127,10 +1142,10 @@ release_undo_size(UndoLogType undoType)
 
 	Assert(undoType != UndoLogNone);
 
-	if (reserved_undo_size != 0)
+	if (reserved_undo_sizes[(int) undoType] != 0)
 	{
-		pg_atomic_fetch_sub_u64(&meta->advanceReservedLocation, reserved_undo_size);
-		reserved_undo_size = 0;
+		pg_atomic_fetch_sub_u64(&meta->advanceReservedLocation, reserved_undo_sizes[(int) undoType]);
+		reserved_undo_sizes[(int) undoType] = 0;
 	}
 	pg_atomic_write_u64(&curProcData->undoRetainLocations[(int) undoType].reservedUndoLocation,
 						InvalidUndoLocation);
@@ -1141,7 +1156,7 @@ get_reserved_undo_size(UndoLogType undoType)
 {
 	Assert(undoType != UndoLogNone);
 
-	return reserved_undo_size;
+	return reserved_undo_sizes[(int) undoType];
 }
 
 void
@@ -1237,19 +1252,41 @@ orioledb_reset_xmin_hook(void)
 	if (ActiveSnapshotSet())
 		return;
 
-	if (pairingheap_is_empty(&retainUndoLocRegularHeap))
+	if (pairingheap_is_empty(&retainUndoLocRegularRowHeap))
 	{
 		pg_atomic_write_u64(&curProcData->undoRetainLocations[UndoLogRegular].snapshotRetainUndoLocation, InvalidUndoLocation);
 	}
 	else
 	{
+		Snapshot	snapshot;
+
 		location = pairingheap_container(RetainUndoLocationPHNode, ph_node,
-										 pairingheap_first(&retainUndoLocRegularHeap));
+										 pairingheap_first(&retainUndoLocRegularRowHeap));
+		snapshot = (Snapshot) ((Pointer) location - offsetof(SnapshotData, undoRegularRowLocationPhNode));
 		if (location->undoLocation > pg_atomic_read_u64(&curProcData->undoRetainLocations[UndoLogRegular].snapshotRetainUndoLocation))
 		{
 			pg_atomic_write_u64(&curProcData->undoRetainLocations[UndoLogRegular].snapshotRetainUndoLocation, location->undoLocation);
-			if (!OXidIsValid(xmin) || location->xmin < xmin)
-				xmin = location->xmin;
+			if (!OXidIsValid(xmin) || snapshot->csnSnapshotData.xmin < xmin)
+				xmin = snapshot->csnSnapshotData.xmin;
+		}
+	}
+
+	if (pairingheap_is_empty(&retainUndoLocRegularPageHeap))
+	{
+		pg_atomic_write_u64(&curProcData->undoRetainLocations[UndoLogRegularPageLevel].snapshotRetainUndoLocation, InvalidUndoLocation);
+	}
+	else
+	{
+		Snapshot	snapshot;
+
+		location = pairingheap_container(RetainUndoLocationPHNode, ph_node,
+										 pairingheap_first(&retainUndoLocRegularPageHeap));
+		snapshot = (Snapshot) ((Pointer) location - offsetof(SnapshotData, undoRegularPageLocationPhNode));
+		if (location->undoLocation > pg_atomic_read_u64(&curProcData->undoRetainLocations[UndoLogRegularPageLevel].snapshotRetainUndoLocation))
+		{
+			pg_atomic_write_u64(&curProcData->undoRetainLocations[UndoLogRegularPageLevel].snapshotRetainUndoLocation, location->undoLocation);
+			if (!OXidIsValid(xmin) || snapshot->csnSnapshotData.xmin < xmin)
+				xmin = snapshot->csnSnapshotData.xmin;
 		}
 	}
 
@@ -1259,13 +1296,16 @@ orioledb_reset_xmin_hook(void)
 	}
 	else
 	{
+		Snapshot	snapshot;
+
 		location = pairingheap_container(RetainUndoLocationPHNode, ph_node,
 										 pairingheap_first(&retainUndoLocSystemHeap));
+		snapshot = (Snapshot) ((Pointer) location - offsetof(SnapshotData, undoSystemLocationPhNode));
 		if (location->undoLocation > pg_atomic_read_u64(&curProcData->undoRetainLocations[UndoLogSystem].snapshotRetainUndoLocation))
 		{
 			pg_atomic_write_u64(&curProcData->undoRetainLocations[UndoLogSystem].snapshotRetainUndoLocation, location->undoLocation);
-			if (!OXidIsValid(xmin) || location->xmin < xmin)
-				xmin = location->xmin;
+			if (!OXidIsValid(xmin) || snapshot->csnSnapshotData.xmin < xmin)
+				xmin = snapshot->csnSnapshotData.xmin;
 		}
 	}
 	pg_atomic_write_u64(&curProcData->xmin, xmin);
@@ -1362,8 +1402,10 @@ undo_xact_callback(XactEvent event, void *arg)
 				 * Remove registered snapshot one-by-one, so that we can avoid
 				 * double removing in undo_snapshot_deregister_hook().
 				 */
-				while (!pairingheap_is_empty(&retainUndoLocRegularHeap))
-					pairingheap_remove_first(&retainUndoLocRegularHeap);
+				while (!pairingheap_is_empty(&retainUndoLocRegularRowHeap))
+					pairingheap_remove_first(&retainUndoLocRegularRowHeap);
+				while (!pairingheap_is_empty(&retainUndoLocRegularPageHeap))
+					pairingheap_remove_first(&retainUndoLocRegularPageHeap);
 				while (!pairingheap_is_empty(&retainUndoLocSystemHeap))
 					pairingheap_remove_first(&retainUndoLocSystemHeap);
 
@@ -1411,6 +1453,9 @@ add_subxact_undo_item(SubTransactionId parentSubid)
 	{
 		UndoLogType undoType = (UndoLogType) i;
 
+		if (undoType == UndoLogRegularPageLevel)
+			continue;
+
 		sharedLocations = GET_CUR_UNDO_STACK_LOCATIONS(undoType);
 		size = sizeof(SubXactUndoStackItem);
 
@@ -1435,6 +1480,8 @@ search_for_undo_sub_location(UndoLogType undoType,
 							 UndoLocation *toLoc, UndoLocation *toSubLoc)
 {
 	SubXactUndoStackItem *item;
+
+	Assert(undoType != UndoLogRegularPageLevel);
 
 	if (!UndoLocationIsValid(location))
 	{
@@ -1513,6 +1560,9 @@ rollback_to_savepoint(UndoLogType undoType, UndoStackKind kind,
 	OXid		oxid;
 	bool		applyResult;
 
+	if (undoType == UndoLogRegularPageLevel)
+		return;
+
 	sharedLocations = GET_CUR_UNDO_STACK_LOCATIONS(undoType);
 	init_undo_item_buf(&buf);
 	location = pg_atomic_read_u64(&sharedLocations->subxactLocation);
@@ -1541,6 +1591,9 @@ update_subxact_undo_location_on_commit(SubTransactionId parentSubid)
 	for (i = 0; i < (int) UndoLogsCount; i++)
 	{
 		UndoLogType undoType = (UndoLogType) i;
+
+		if (undoType == UndoLogRegularPageLevel)
+			continue;
 
 		sharedLocations = GET_CUR_UNDO_STACK_LOCATIONS(undoType);
 		init_undo_item_buf(&buf);
@@ -1618,6 +1671,7 @@ have_current_undo(UndoLogType undoType)
 void
 report_undo_overflow(void)
 {
+	Assert(false);
 	ereport(ERROR,
 			(errcode(ERRCODE_INTERNAL_ERROR),
 			 errmsg("failed to add an undo record: undo size is exceeded")));
@@ -1874,7 +1928,8 @@ undoLocCmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
 void
 undo_snapshot_register_hook(Snapshot snapshot)
 {
-	pairingheap_add(&retainUndoLocRegularHeap, &snapshot->undoRegularLocationPhNode.ph_node);
+	pairingheap_add(&retainUndoLocRegularRowHeap, &snapshot->undoRegularRowLocationPhNode.ph_node);
+	pairingheap_add(&retainUndoLocRegularPageHeap, &snapshot->undoRegularPageLocationPhNode.ph_node);
 	pairingheap_add(&retainUndoLocSystemHeap, &snapshot->undoSystemLocationPhNode.ph_node);
 }
 
@@ -1884,9 +1939,13 @@ undo_snapshot_deregister_hook(Snapshot snapshot)
 	/*
 	 * Skip if it was already removed during transaction abort.
 	 */
-	if (snapshot->undoRegularLocationPhNode.ph_node.prev_or_parent != NULL ||
-		&snapshot->undoRegularLocationPhNode.ph_node == retainUndoLocRegularHeap.ph_root)
-		pairingheap_remove(&retainUndoLocRegularHeap, &snapshot->undoRegularLocationPhNode.ph_node);
+	if (snapshot->undoRegularRowLocationPhNode.ph_node.prev_or_parent != NULL ||
+		&snapshot->undoRegularRowLocationPhNode.ph_node == retainUndoLocRegularRowHeap.ph_root)
+		pairingheap_remove(&retainUndoLocRegularRowHeap, &snapshot->undoRegularRowLocationPhNode.ph_node);
+
+	if (snapshot->undoRegularPageLocationPhNode.ph_node.prev_or_parent != NULL ||
+		&snapshot->undoRegularPageLocationPhNode.ph_node == retainUndoLocRegularPageHeap.ph_root)
+		pairingheap_remove(&retainUndoLocRegularPageHeap, &snapshot->undoRegularPageLocationPhNode.ph_node);
 
 	if (snapshot->undoSystemLocationPhNode.ph_node.prev_or_parent != NULL ||
 		&snapshot->undoSystemLocationPhNode.ph_node == retainUndoLocSystemHeap.ph_root)
@@ -1898,7 +1957,8 @@ orioledb_snapshot_hook(Snapshot snapshot)
 {
 	UndoLocation lastUsedLocation,
 				lastUsedUndoLocationWhenUpdatedMinLocation;
-	OXid		curXmin;
+	OXid		curXmin,
+				xmin;
 	ODBProcData *curProcData = GET_CUR_PROCDATA();
 	int			i;
 
@@ -1925,12 +1985,13 @@ orioledb_snapshot_hook(Snapshot snapshot)
 	}
 
 
-	snapshot->undoRegularLocationPhNode.undoLocation = set_my_retain_location(UndoLogRegular);
+	snapshot->undoRegularRowLocationPhNode.undoLocation = set_my_retain_location(UndoLogRegular);
+	snapshot->undoRegularPageLocationPhNode.undoLocation = set_my_retain_location(UndoLogRegularPageLevel);
 	snapshot->undoSystemLocationPhNode.undoLocation = set_my_retain_location(UndoLogSystem);
-	snapshot->undoRegularLocationPhNode.xmin = snapshot->undoSystemLocationPhNode.xmin = pg_atomic_read_u64(&xid_meta->runXmin);
+	xmin = pg_atomic_read_u64(&xid_meta->runXmin);
 	curXmin = pg_atomic_read_u64(&curProcData->xmin);
 	if (!OXidIsValid(curXmin))
-		pg_atomic_write_u64(&curProcData->xmin, snapshot->undoRegularLocationPhNode.xmin);
+		pg_atomic_write_u64(&curProcData->xmin, xmin);
 
 	/*
 	 * Snapshot CSN could be newer than retained location, not older.  Enforce
@@ -1940,7 +2001,7 @@ orioledb_snapshot_hook(Snapshot snapshot)
 
 	snapshot->csnSnapshotData.snapshotcsn = pg_atomic_read_u64(&TRANSAM_VARIABLES->nextCommitSeqNo);
 	snapshot->csnSnapshotData.xlogptr = InvalidXLogRecPtr;
-	snapshot->csnSnapshotData.xmin = pg_atomic_read_u64(&xid_meta->runXmin);
+	snapshot->csnSnapshotData.xmin = xmin;
 }
 
 static void
