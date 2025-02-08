@@ -1563,6 +1563,8 @@ jsonb_push_bool_key(JsonbParseState **state, char *key, bool value)
 
 	jsonb_push_key(state, key);
 
+	ASAN_UNPOISON_MEMORY_REGION(&jval, sizeof(jval));
+
 	jval.type = jbvBool;
 	jval.val.boolean = value;
 	(void) pushJsonbValue(state, WJB_VALUE, &jval);
